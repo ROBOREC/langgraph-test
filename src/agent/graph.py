@@ -1,6 +1,6 @@
 """LangGraph two-node chatbot:
 1) check_number  → if user input is a number, reply with number+1
-2) call_model    → otherwise call OpenAI LLM
+2) call_model    → otherwise call OpenAI LLM via langchain-openai
 
 Includes: my_text context → appended to final assistant message.
 """
@@ -8,13 +8,13 @@ Includes: my_text context → appended to final assistant message.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
 from typing_extensions import TypedDict
 
-from openai import AsyncOpenAI
+from langchain_openai import ChatOpenAI
 
 
 # ---------- Context: uses my_text ----------
@@ -34,7 +34,12 @@ class State:
     number_handled: bool = False
 
 
-client = AsyncOpenAI()
+# ---------- LLM client (langchain-openai wrapper around OpenAI) ----------
+
+llm = ChatOpenAI(
+    model="gpt-5-mini",  # change model name here if you want
+    temperature=0
+)
 
 
 # ---------- NODE 1: detect number ----------
@@ -45,10 +50,10 @@ async def check_number(state: State, runtime: Runtime[Context]) -> Dict[str, Any
         return {}
 
     last = messages[-1]
-    if last["role"] != "user":
+    if last.get("role") != "user":
         return {}
 
-    text = last["content"].strip()
+    text = str(last.get("content", "")).strip()
 
     # Try to parse number
     try:
@@ -66,22 +71,19 @@ async def check_number(state: State, runtime: Runtime[Context]) -> Dict[str, Any
         "messages": messages + [
             {"role": "assistant", "content": final_text}
         ],
-        "number_handled": True
+        "number_handled": True,
     }
 
 
 # ---------- NODE 2: LLM fallback ----------
 
 async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
+    # Use the existing history from state
     messages = list(state.messages)
 
-    completion = await client.chat.completions.create(
-        model="gpt-5-mini",
-        messages=messages,
-    )
-
-    assistant_msg = completion.choices[0].message
-    base_text = assistant_msg.content
+    # Call LLM with full history
+    response = await llm.ainvoke(messages)
+    base_text = response.content
 
     # Add configurable suffix (my_text)
     suffix = (runtime.context or {}).get("my_text", "")
