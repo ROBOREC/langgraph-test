@@ -1,15 +1,14 @@
-"""LangGraph single-node graph template turned into a simple chatbot.
+"""LangGraph two-node chatbot:
+1) check_number  → if user input is a number, reply with number+1
+2) call_model    → otherwise call OpenAI LLM
 
-It:
-- accepts a list of chat messages in the state
-- sends full history to OpenAI
-- appends the assistant's reply to the history
+Includes: my_text context → appended to final assistant message.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
@@ -18,89 +17,98 @@ from typing_extensions import TypedDict
 from openai import AsyncOpenAI
 
 
-# ---------- Context (optional, configurable from deployment) ----------
+# ---------- Context: uses my_text ----------
 
 class Context(TypedDict, total=False):
-    """Context parameters for the agent.
-
-    You can set these when creating assistants OR when invoking the graph.
-    For example you can pass a system prefix or mode flag.
+    """You can set 'my_text' in your deployment config.
+    It will be appended to every final assistant message.
     """
+    my_text: str
 
-    my_configurable_param: str  # e.g. "teacher-mode", "debug", etc.
 
-
-# ---------- State definition (this is what the graph receives & returns) ----------
+# ---------- State ----------
 
 @dataclass
 class State:
-    """Chat state: full history of messages.
-
-    Each message is a dict like:
-      {"role": "user" | "assistant" | "system", "content": "text"}
-
-    When you invoke the graph, you pass:
-      {"messages": [{"role": "user", "content": "Hello"}]}
-    """
-
     messages: List[Dict[str, str]] = field(default_factory=list)
+    number_handled: bool = False
 
 
-# ---------- OpenAI client setup (newest models live here) ----------
-
-client = AsyncOpenAI()  # reads OPENAI_API_KEY from env
+client = AsyncOpenAI()
 
 
-# ---------- Node logic: call OpenAI with message history ----------
+# ---------- NODE 1: detect number ----------
+
+async def check_number(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
+    messages = state.messages
+    if not messages:
+        return {}
+
+    last = messages[-1]
+    if last["role"] != "user":
+        return {}
+
+    text = last["content"].strip()
+
+    # Try to parse number
+    try:
+        num = float(text)
+    except ValueError:
+        return {}  # not a number → go to LLM
+
+    result = num + 1
+
+    # Add configurable suffix (my_text)
+    suffix = (runtime.context or {}).get("my_text", "")
+    final_text = f"{result}" + (f" {suffix}" if suffix else "")
+
+    return {
+        "messages": messages + [
+            {"role": "assistant", "content": final_text}
+        ],
+        "number_handled": True
+    }
+
+
+# ---------- NODE 2: LLM fallback ----------
 
 async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
-    """Single node of the graph.
+    messages = list(state.messages)
 
-    - Reads message history from state
-    - Optionally uses runtime.context["my_configurable_param"]
-    - Calls OpenAI with the full history
-    - Appends assistant reply to state
-    """
-    messages = list(state.messages)  # copy
-
-    # Optional: contextual system prompt based on config
-    cfg = (runtime.context or {}).get("my_configurable_param")
-    if cfg:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant. "
-                    f"Special mode: {cfg}."
-                ),
-            },
-            *messages,
-        ]
-
-    # Call the latest OpenAI chat model (you can switch to gpt-4.1, o3, etc.)
     completion = await client.chat.completions.create(
-        model="gpt-5-mini",  # <-- change model name here if you want
+        model="gpt-5-mini",
         messages=messages,
     )
 
-    assistant_message = completion.choices[0].message
+    assistant_msg = completion.choices[0].message
+    base_text = assistant_msg.content
 
-    # Convert SDK message object to plain dict and append to history
-    new_messages = state.messages + [
-        {
-            "role": assistant_message.role,
-            "content": assistant_message.content,
-        }
-    ]
+    # Add configurable suffix (my_text)
+    suffix = (runtime.context or {}).get("my_text", "")
+    final_text = base_text + (f" {suffix}" if suffix else "")
 
-    return {"messages": new_messages}
+    return {
+        "messages": state.messages + [
+            {"role": "assistant", "content": final_text}
+        ]
+    }
 
 
-# ---------- Graph definition ----------
+# ---------- Router ----------
+
+def router(state: State):
+    if state.number_handled:
+        return "__end__"
+    return "call_model"
+
+
+# ---------- Graph ----------
 
 graph = (
     StateGraph(State, context_schema=Context)
-    .add_node(call_model)                 # node name auto = "call_model"
-    .add_edge("__start__", "call_model")  # START -> node
+    .add_node("check_number", check_number)
+    .add_node("call_model", call_model)
+    .add_edge("__start__", "check_number")
+    .add_conditional_edges("check_number", router, ["__end__", "call_model"])
     .compile(name="Chatbot Graph")
 )
