@@ -1,23 +1,11 @@
-"""LangGraph two-node chatbot, NO external dependencies.
-Uses langgraph.prebuilt.chat_model (built-in wrapper)."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from langgraph.graph import StateGraph
-from langgraph.runtime import Runtime
-from typing_extensions import TypedDict
-
-from langgraph.prebuilt import chat_model   # <-- built-in model wrapper
-
-
-# ---------- Context ----------
-
-class Context(TypedDict, total=False):
-    my_text: str
-
+from langgraph.graph import StateGraph, END
+from langchain_core.runnables import RunnableConfig
+from langchain_openai import ChatOpenAI  # <-- REQUIRED: Real model driver
 
 # ---------- State ----------
 
@@ -26,16 +14,15 @@ class State:
     messages: List[Dict[str, str]] = field(default_factory=list)
     number_handled: bool = False
 
+# ---------- LLM Setup ----------
 
-# ---------- Built-in LLM (NO external deps) ----------
-
-# This uses the OPENAI_API_KEY automatically
-llm = chat_model("gpt-4.1-mini")   # ← You can change model here
-
+# You must have langchain-openai installed and OPENAI_API_KEY in your env
+# "gpt-4.1-mini" is not valid; assumed "gpt-4o-mini"
+llm = ChatOpenAI(model="gpt-4o-mini") 
 
 # ---------- NODE 1: detect number ----------
 
-async def check_number(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
+async def check_number(state: State, config: RunnableConfig) -> Dict[str, Any]:
     messages = state.messages
     if not messages:
         return {}
@@ -49,11 +36,14 @@ async def check_number(state: State, runtime: Runtime[Context]) -> Dict[str, Any
     try:
         num = float(text)
     except ValueError:
-        return {}  # not a number → go to LLM
+        return {}  # not a number -> go to LLM
 
     result = num + 1
 
-    suffix = (runtime.context or {}).get("my_text", "")
+    # Access config/context safely
+    configurable = config.get("configurable", {})
+    suffix = configurable.get("my_text", "")
+    
     final_text = f"{result}" + (f" {suffix}" if suffix else "")
 
     return {
@@ -63,24 +53,25 @@ async def check_number(state: State, runtime: Runtime[Context]) -> Dict[str, Any
         "number_handled": True,
     }
 
-
 # ---------- NODE 2: LLM fallback ----------
 
-async def call_model(state: State, runtime: Runtime[Context]) -> Dict[str, Any]:
+async def call_model(state: State, config: RunnableConfig) -> Dict[str, Any]:
     messages = list(state.messages)
 
+    # Invoke the real LangChain model
     response = await llm.ainvoke(messages)
     base_text = response.content
 
-    suffix = (runtime.context or {}).get("my_text", "")
-    final_text = base_text + (f" {suffix}" if suffix else "")
+    configurable = config.get("configurable", {})
+    suffix = configurable.get("my_text", "")
+    
+    final_text = str(base_text) + (f" {suffix}" if suffix else "")
 
     return {
         "messages": state.messages + [
             {"role": "assistant", "content": final_text}
         ]
     }
-
 
 # ---------- Router ----------
 
@@ -89,14 +80,16 @@ def router(state: State):
         return "__end__"
     return "call_model"
 
-
 # ---------- Graph ----------
 
 graph = (
-    StateGraph(State, context_schema=Context)
+    StateGraph(State)
     .add_node("check_number", check_number)
     .add_node("call_model", call_model)
     .add_edge("__start__", "check_number")
-    .add_conditional_edges("check_number", router, ["__end__", "call_model"])
-    .compile(name="Chatbot Graph")
+    .add_conditional_edges("check_number", router, {
+        "__end__": END, 
+        "call_model": "call_model"
+    })
+    .compile()
 )
